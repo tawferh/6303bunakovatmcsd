@@ -1,0 +1,243 @@
+import os
+import csv
+import random
+import requests
+import json
+import time
+import cv2
+import numpy as np
+from numba import jit
+
+painting_id = []
+
+# 1
+def download_random():
+    if not painting_id:
+        with open("/content/drive/MyDrive/MetObjects.csv", newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                if row['Classification'] == 'Paintings':
+                    object_id = row['Object ID']
+                    if object_id and object_id.isdigit():
+                        painting_id.append(int(object_id))
+    if not painting_id:
+        print("not paintings on images")
+        exit()
+
+    max_att = 10
+    for att in range(max_att):
+        obj_id = random.choice(painting_id)
+        api_url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{obj_id}"
+
+        response = requests.get(api_url)
+
+        if response.status_code != 200:
+            print(f"error api: {response.status_code}")
+            continue
+
+        object_data = response.json()
+        img_url = object_data.get('primaryImage')
+
+        if not img_url:
+            print("error")
+            continue
+
+        save_dir = 'paintings'
+        os.makedirs(save_dir, exist_ok=True)
+
+        base_name = str(obj_id)
+        jpg_path = os.path.join(save_dir, base_name + '.jpg')
+        json_path = os.path.join(save_dir, base_name + '.json')
+
+        img_response = requests.get(img_url)
+        if img_response.status_code == 200:
+            with open(jpg_path, 'wb') as f:
+                f.write(img_response.content)
+            print(f"img save: {jpg_path}")
+
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(object_data, f, indent=2, ensure_ascii=False)
+            print(f"metadata save: {json_path}")
+
+            return jpg_path, object_data, base_name
+        else:
+            print(f"error {img_response.status_code}")
+            continue
+
+    print("Не удалось найти подходящее изображение после 10 попыток")
+    exit()
+
+
+# 2
+def load_img(path):
+    img = cv2.imread(path)
+    if img is None:
+        raise ValueError(f"Не удалось загрузить изображение по пути: {path}")
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h, w = img.shape[:2]
+    return img_rgb
+
+
+# приведение изображения к полутоновому
+def grayscale(image):
+    if len(image.shape) == 2:
+        return image
+    gray = 0.299 * image[:, :, 0] + 0.587 * image[:, :, 1] + 0.114 * image[:, :, 2]
+    return gray.astype(np.uint8)
+
+
+def grayscale_lib(image):
+    return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+
+# свёртка и использование двумерной маски
+@jit
+def convolve2d(image, kernel):
+    h, w = image.shape
+    hk, wk = kernel.shape
+
+    # padding
+    pad_h, pad_w = hk // 2, wk // 2
+    padded = np.zeros((h + 2 * pad_h, w + 2 * pad_w), dtype=np.float32)
+
+    padded[pad_h: pad_h + h, pad_w: pad_w + w] = image
+    result = np.zeros((h, w), dtype=np.float32)
+
+    for i in range(h):
+        for j in range(w):
+            region = padded[i:i + hk, j:j + wk]
+            result[i, j] = np.sum(region * kernel)
+    return result
+
+
+def cust_convolution(image, kernel):
+    if len(image.shape) == 3:
+        result = np.zeros_like(image, dtype=np.float32)
+        for c in range(image.shape[2]):
+            result[:, :, c] = convolve2d(image[:, :, c].astype(np.float32), kernel)
+        return np.clip(result, 0, 255).astype(np.uint8)
+    else:
+        # для полутонового изображения
+        result = convolve2d(image.astype(np.float32), kernel)
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def conv_lib(image, kernel):
+    return cv2.filter2D(image, -1, kernel)
+
+
+# сглаживание
+def gauss(size=3, sigma=1.0):
+    kernel = np.zeros((size, size), dtype=np.float32)
+    center = size // 2
+
+    for i in range(size):
+        for j in range(size):
+            x = i - center
+            y = j - center
+            kernel[i, j] = np.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
+    kernel = kernel / np.sum(kernel)
+    return kernel
+
+
+def cust_gauss(image, kernel_size=3, sigma=1.0):
+    kernel = gauss(kernel_size, sigma)
+    return cust_convolution(image, kernel)
+
+
+def lib_gauss(image, kernel_size=3, sigma=1.0):
+    return cv2.GaussianBlur(image, (kernel_size, kernel_size), sigma)
+
+
+# выделение границ
+def sobel(image):
+    gray = grayscale(image)
+    sobel_x = np.array([
+        [-1, 0, 1],
+        [-2, 0, 2],
+        [-1, 0, 1]
+    ], dtype=np.float32)
+
+    sobel_y = np.array([
+        [-1, -2, -1],
+        [0, 0, 0],
+        [1, 2, 1]
+    ], dtype=np.float32)
+
+    grad_x = convolve2d(gray, sobel_x)
+    grad_y = convolve2d(gray, sobel_y)
+
+    grad = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    grad = (grad / grad.max() * 255).astype(np.uint8)
+    return grad
+
+
+def lib_sobel(image):
+    gray = grayscale_lib(image)
+
+    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+
+    grad = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    grad = cv2.normalize(grad, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    return grad
+
+
+def compare(image, custom_func, lib_func, *args):
+    start = time.time()
+    cust_res = custom_func(image, *args)
+    cust_time = time.time() - start
+
+    start = time.time()
+    lib_res = lib_func(image, *args)
+    lib_time = time.time() - start
+
+    print(f"собственная реализация: {cust_time:.4f}")
+    print(f"библиотечная реализация: {lib_time:.4f}")
+    print(f"разница: {abs(cust_time - lib_time):.4f}")
+
+    return cust_res, lib_res
+
+
+def save_results(results_dict, base_filename, save_dir='paintings'):
+    os.makedirs(save_dir, exist_ok=True)
+    for name, image in results_dict.items():
+        if image is not None:
+            if len(image.shape) == 3:
+                save_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            else:
+                save_image = image
+            path = os.path.join(save_dir, f"{base_filename}_{name}.jpg")
+            cv2.imwrite(path, save_image)
+            print(f"Сохранено: {path}")
+
+
+def main():
+    path, object_data, base_name = download_random()
+    img = load_img(path)
+
+    final_img = {}
+
+    print("Приведение к полутоновому изображению")
+    c_gray, l_gray = compare(img, grayscale, grayscale_lib)
+    final_img["gray_cust"] = c_gray
+    final_img["gray_lib"] = l_gray
+
+    print("Сглаживание по Гауссу")
+    c_blur, l_blur = compare(img, cust_gauss, lib_gauss, 5, 1.5)
+    final_img["blur_custom"] = c_blur
+    final_img["blur_lib"] = l_blur
+
+    print("Выделение границ")
+    c_sobel, l_sobel = compare(img, sobel, lib_sobel)
+    final_img["sobel_custom"] = c_sobel
+    final_img["sobel_lib"] = l_sobel
+
+    save_results(final_img, base_name)
+
+
+if __name__ == "__main__":
+    main()
